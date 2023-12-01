@@ -1,0 +1,106 @@
+Все нормально, но я бы в некоторых местах сделал иначе:
+
+1). Хранить секреты в гитхабе - плохо. 
+Можно было сделать так:
+    Создаем файл .env
+    Файл .env должен лежать в той же директории, что и исполняемый файл.
+    Никогда не загружайте файл .env в удаленный репозиторий.
+    Проверьте, что в .gitignore есть строчка .env
+
+    import os 
+    from dotenv import load_dotenv 
+
+    load_dotenv() 
+
+    secret_token = os.getenv('TOKEN') 
+
+В случае с Airflow секреты лучше хранить в Connections.
+    
+    from airflow.hooks.base import BaseHook
+
+    dwh_con = BaseHook.get_connection(dwh_connection_id)
+
+    source_connection = pyodbc.connect(
+        'DRIVER={'+driver+'};SERVER=' + source_con.host \
+        + ';DATABASE='+source_con.schema \
+        + ';ENCRYPT=no;UID='+source_con.login \
+        + ';PWD=' + source_con.password
+    )
+
+2). Для создания своего оператора в Airflow можно наследоваться от BaseOperator и переопределить два метода: init и  execute
+
+    from airflow.models.baseoperator import BaseOperator
+    from airflow.utils.decorators import apply_defaults
+    from urllib.request import urlretrieve
+
+    from airflow import DAG
+    from airflow.operators.dummy_operator import DummyOperator
+    from datetime import datetime
+    from custom_operators import DownloadFileOperator
+
+
+    class DownloadFileOperator(BaseOperator):
+        @apply_defaults
+        def __init__(self, source_url, destination_dir, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.source_url = source_url
+            self.destination_dir = destination_dir
+        def execute(self, context):
+            self.log.info('Downloading file from %s', self.source_url)
+            file_path, _ = urlretrieve(self.source_url)
+            self.log.info('File downloaded to %s', file_path)
+            self.log.info('Moving file to %s', self.destination_dir)
+            shutil.move(file_path, self.destination_dir)
+            self.log.info('File moved to %s', self.destination_dir)
+
+
+    dag = DAG(
+        'download_file_dag',
+        description='Download a file from a remote location and save it to a local directory',
+        schedule_interval=None,
+        start_date=datetime(2023, 3, 26),
+    )
+    start = DummyOperator(task_id='start', dag=dag)
+    download_file = DownloadFileOperator(
+        task_id='download_file',
+        source_url='https://example.com/file.txt',
+        destination_dir='/path/to/local/directory',
+        dag=dag,
+    )
+
+    end = DummyOperator(task_id='end', dag=dag)
+    start >> download_file >> end
+
+3) XCOM не рекомендуется использовать для обмена батчами данных между задачами. т.к все эти данные будут записываться в базу метаданных Airflow 
+Если есть необходимость передавать батчи между задачами, то лучше это делать через выгрузку в .csv в общую для всех воркеров шару.
+
+4) Если уж решили использовать pandas, то для создания DF можно использовать pd.read_sql(), а для записи DF в СУБД df.to_sql()
+
+5) 
+
+            for record in df:
+                query = """INSERT INTO (field1, field2, field3)
+                           VALUES(?, ?, ?)',
+                           (record.field1, record.field2, record.field3) """
+                self.cursor.execute(query)
+            self.conn.commit()
+
+    Построчная вставка это долого и не везде сработает.
+    Лучше делать вот так :
+
+    df = pd.read_csv(...)
+	cols = ','.join(list(df.columns))
+    insert_stmt = f"INSERT INTO stage.{pg_table} (id,{cols}) VALUES %s"
+    c = BaseHook.get_connection('pg_connection')
+    pg_conn = psycopg2.connect(
+        host=c.host,
+        port=c.port,
+        dbname='de',
+        user=c.login,
+        password=c.password   
+    )
+    cur = pg_conn.cursor()
+    psycopg2.extras.execute_values(cur, insert_stmt, df.values)
+    pg_conn.commit()
+    cur.close()
+    pg_conn.close()
